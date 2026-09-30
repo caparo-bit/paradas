@@ -1,11 +1,10 @@
 /* ============================================================
-   TaxiDiario — Cliente Web Push
+   TaxiDiario — Cliente de notificaciones push
    © 2026 TaxiDiario. Todos los derechos reservados.
    ============================================================ */
 
-(function(){
+(function () {
   const NTFY_BASE = "https://ntfy.sh";
-
   const SW_URL = "sw.js";
   const SW_SCOPE = new URL("./", document.baseURI).pathname;
 
@@ -42,7 +41,7 @@
   }
 
   // ------------------------------------------------------------
-  // ArrayBuffer → base64 (SIN spread, evita RangeError)
+  // ArrayBuffer → base64 (sin spread, evita RangeError)
   // ------------------------------------------------------------
   function bufferToBase64(buffer) {
     const bytes = new Uint8Array(buffer);
@@ -54,42 +53,48 @@
   }
 
   // ------------------------------------------------------------
-  // Obtener VAPID public key del servidor ntfy
+  // Suscribirse a Web Push (solo funciona en servidores
+  // autoalojados con VAPID configurado. En ntfy.sh público
+  // devolverá error, pero lo intentamos por si acaso).
   // ------------------------------------------------------------
-  async function obtenerVapidKey() {
-    try {
-      const res = await fetch(`${NTFY_BASE}/v1/config`);
-      if (!res.ok) return null;
-      const cfg = await res.json();
-      return cfg["web-push-public-key"] || null;
-    } catch (e) {
-      return null;
+  async function suscribirWebPush(topic) {
+    if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
+      return { ok: false, motivo: "Web Push no soportado en este navegador" };
     }
-  }
+    if (!("Notification" in window)) {
+      return { ok: false, motivo: "Notificaciones no soportadas" };
+    }
 
-  // ------------------------------------------------------------
-  // Suscribir al push
-  // ------------------------------------------------------------
-  async function suscribirPush(topic) {
+    const permiso = await Notification.requestPermission();
+    if (permiso !== "granted") {
+      return { ok: false, motivo: "Permiso de notificaciones denegado" };
+    }
+
     try {
-      const permiso = await Notification.requestPermission();
-      if (permiso !== "granted") {
-        console.warn("[Push] Permiso denegado");
-        return { ok: false, motivo: "denegado" };
+      const reg = await registrarSW();
+      if (!reg) return { ok: false, motivo: "No se pudo registrar el Service Worker" };
+
+      await navigator.serviceWorker.ready;
+
+      // Intentar obtener la VAPID key del servidor ntfy
+      let vapidKey = null;
+      try {
+        const res = await fetch(`${NTFY_BASE}/v1/config`);
+        if (res.ok) {
+          const cfg = await res.json();
+          vapidKey = cfg["web-push-public-key"] || null;
+        }
+      } catch (e) {
+        // Ignorar
       }
 
-      const vapidKey = await obtenerVapidKey();
       if (!vapidKey) {
         return {
           ok: false,
-          motivo: "ntfy.sh público no soporta Web Push. Usa self-hosted o FCM.",
+          motivo: "ntfy.sh público no expone Web Push para terceros. Usa la app oficial de ntfy o autoaloja tu servidor.",
+          necesitaApp: true,
         };
       }
-
-      const reg = await registrarSW();
-      if (!reg) return { ok: false, motivo: "sin-sw" };
-
-      await navigator.serviceWorker.ready;
 
       let sub = await reg.pushManager.getSubscription();
       if (!sub) {
@@ -99,46 +104,41 @@
         });
       }
 
-      console.log("[Push] Suscripción:", sub.endpoint);
+      // Intentar registrar la suscripción en ntfy
+      // (este endpoint solo existe en servidores autoalojados con Web Push)
+      const payload = {
+        endpoint: sub.endpoint,
+        keys: {
+          p256dh: bufferToBase64(sub.getKey("p256dh")),
+          auth: bufferToBase64(sub.getKey("auth")),
+        },
+      };
 
-      await enviarSuscripcionANtfy(topic, sub);
+      const res = await fetch(`${NTFY_BASE}/${encodeURIComponent(topic)}/subscribe`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      if (!res.ok) {
+        return {
+          ok: false,
+          motivo: "El servidor ntfy no aceptó la suscripción Web Push (código " + res.status + ").",
+          necesitaApp: true,
+        };
+      }
 
       return { ok: true, endpoint: sub.endpoint };
     } catch (e) {
-      console.error("[Push] Error suscribiendo:", e);
-      return { ok: false, motivo: e.message };
+      console.error("[Push] Error en Web Push:", e);
+      return { ok: false, motivo: e.message, necesitaApp: true };
     }
   }
 
   // ------------------------------------------------------------
-  // Enviar suscripción al endpoint de ntfy
+  // Desuscribir de Web Push
   // ------------------------------------------------------------
-  async function enviarSuscripcionANtfy(topic, subscription) {
-    const payload = {
-      endpoint: subscription.endpoint,
-      keys: {
-        p256dh: bufferToBase64(subscription.getKey("p256dh")),
-        auth:   bufferToBase64(subscription.getKey("auth")),
-      },
-    };
-
-    const res = await fetch(`${NTFY_BASE}/${encodeURIComponent(topic)}/subscribe`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      throw new Error(`ntfy respondió ${res.status}: ${txt}`);
-    }
-    console.log("[Push] Suscripción enviada a ntfy para topic:", topic);
-  }
-
-  // ------------------------------------------------------------
-  // Desuscribir
-  // ------------------------------------------------------------
-  async function desuscribirPush() {
+  async function desuscribirWebPush() {
     try {
       const reg = await navigator.serviceWorker.getRegistration(SW_SCOPE);
       if (!reg) return { ok: false };
@@ -152,13 +152,31 @@
   }
 
   // ------------------------------------------------------------
+  // Publicar un mensaje de prueba en el topic
+  // ------------------------------------------------------------
+  async function probarNotificacion(topic) {
+    try {
+      const res = await fetch(`${NTFY_BASE}/${encodeURIComponent(topic)}`, {
+        method: "POST",
+        headers: { "Title": "🔥 TaxiDiario prueba", "Priority": "high", "Tags": "fire" },
+        body: "Si ves esto, las notificaciones funcionan correctamente.",
+      });
+      return res.ok;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // ------------------------------------------------------------
   // API pública
   // ------------------------------------------------------------
   window.TaxiPush = {
-    suscribir: suscribirPush,
-    desuscribir: desuscribirPush,
     registrarSW,
+    suscribirWebPush,
+    desuscribirWebPush,
+    probarNotificacion,
     estaSoportado: () => "serviceWorker" in navigator && "PushManager" in window,
     permisos: () => ("Notification" in window ? Notification.permission : "unsupported"),
+    NTFY_BASE,
   };
 })();
