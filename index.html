@@ -178,6 +178,9 @@ const FILTRO_RADIO_AVISO_M = 3000;
 const SEED_CANAL = "txd-2026-caparo-bit-paradas-cambia-esta-semilla-por-algo-unico-tuyo-a8f3e1b9c2d4";
 const PREFIJO_CANAL = "txd-cl-";
 const CANAL_GLOBAL = "txd-global-paradas-2026";
+const CANAL_GLOBAL_AVISOS = "txd-global-avisos-2026-v1";
+const PANTALLA_TTL_MS = 30 * 60 * 1000;
+const MODO_PANTALLA = new URLSearchParams(location.search).get("pantalla") === "1";
 
 const MISMA_PARADA_MS  = 60*1000;
 const MISMA_PARADA_DEDUP_MS = 5*60*1000;
@@ -420,9 +423,9 @@ function registrarPublicacion(tipo) {
 
 /* ===================== Cola ===================== */
 let procesandoCola = false;
-async function publicarEnNtfy(canal, headers, body, tipo) {
-  if (!puedePublicar(tipo)) return false;
-  registrarPublicacion(tipo);
+async function publicarEnNtfy(canal, headers, body, tipo, omitirRateLimit = false) {
+  if (!omitirRateLimit && !puedePublicar(tipo)) return false;
+  if (!omitirRateLimit) registrarPublicacion(tipo);
   state.colaPublicacion.push({ canal, headers, body, tipo, intentos: 0, ts: Date.now() });
   save();
   actualizarBadgeRed();
@@ -738,7 +741,10 @@ async function notificarHayPublico() {
   addHayPublico(msg);
   const headers = { "Content-Type":"application/json", "Title":"Hay público", "Priority":"high", "Tags":"fire" };
   const ok = await publicarEnNtfy(cluster.canal, headers, JSON.stringify(msg), "hayPublico");
-  if (ok) showToast(`🔥 Enviado a ${cluster.nombre}`);
+  if (ok) {
+    showToast(`🔥 Enviado a ${cluster.nombre}`);
+    publicarEnNtfy(CANAL_GLOBAL_AVISOS, headers, JSON.stringify(msg), "mirror", true);
+  }
 }
 
 function pedirConfirmacionHayPublico() {
@@ -925,6 +931,157 @@ let map = null, userMarker = null, userCircle = null;
 let paradaMarkers = {};
 let lastPosition = null, watchId = null;
 let activeCharts = [];
+
+/* ===================== Modo segunda pantalla ===================== */
+let pantallaAlertas = [];
+let pantallaSSE = null;
+
+function initModoPantalla() {
+  document.body.innerHTML = `
+    <div class="min-h-screen bg-black text-white p-4">
+      <header class="flex items-center justify-between mb-4 pb-3 border-b border-neutral-800">
+        <div>
+          <div class="text-xs text-neutral-500 uppercase tracking-wide">TaxiDiario · Segunda pantalla</div>
+          <h1 class="text-2xl md:text-4xl font-bold">🔥 Avisos de público</h1>
+        </div>
+        <div class="text-right">
+          <div id="pantalla-status" class="text-xs text-yellow-500">● Conectando…</div>
+          <div id="pantalla-clock" class="text-2xl md:text-4xl font-mono font-bold"></div>
+        </div>
+      </header>
+      <div id="pantalla-lista" class="space-y-3"></div>
+      <div id="pantalla-vacio" class="text-center py-24 text-neutral-600">
+        <div class="text-7xl mb-3">📻</div>
+        <p class="text-lg">Esperando avisos…</p>
+      </div>
+    </div>`;
+
+  setInterval(() => {
+    const el = document.getElementById("pantalla-clock");
+    if (el) el.textContent = new Date().toLocaleTimeString("es-ES");
+  }, 1000);
+
+  if ("Notification" in window && Notification.permission === "default") {
+    Notification.requestPermission().catch(() => {});
+  }
+
+  suscribirPantallaGlobal();
+
+  setInterval(() => {
+    const ahora = Date.now();
+    pantallaAlertas = pantallaAlertas.filter(a => ahora - a.ts < PANTALLA_TTL_MS);
+    pintarPantalla();
+  }, 5000);
+}
+
+async function suscribirPantallaGlobal() {
+  try {
+    const res = await fetch(`${NTFY_BASE}/${CANAL_GLOBAL_AVISOS}/json?poll=1&since=30m`);
+    const text = await res.text();
+    text.trim().split("\n").filter(Boolean).forEach(line => {
+      try {
+        const data = JSON.parse(line);
+        if (data.event === "message" && data.message) {
+          const payload = JSON.parse(data.message);
+          if (payload.type === "hayPublico") añadirAlertaPantalla(payload, false);
+        }
+      } catch(e){}
+    });
+    pintarPantalla();
+  } catch(e){}
+
+  try {
+    const es = new EventSource(`${NTFY_BASE}/${CANAL_GLOBAL_AVISOS}/sse`);
+    es.onopen = () => {
+      const el = document.getElementById("pantalla-status");
+      if (el) { el.textContent = "● En directo"; el.className = "text-xs text-green-500"; }
+    };
+    es.onmessage = (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        if (data.event === "message" && data.message) {
+          const payload = JSON.parse(data.message);
+          if (payload.type === "hayPublico") añadirAlertaPantalla(payload, true);
+        }
+      } catch(err){}
+    };
+    es.onerror = () => {
+      const el = document.getElementById("pantalla-status");
+      if (el) { el.textContent = "● Reconectando…"; el.className = "text-xs text-yellow-500"; }
+    };
+    pantallaSSE = es;
+  } catch(e){}
+}
+
+function añadirAlertaPantalla(payload, esNueva) {
+  if (!payload || !payload.id) return;
+  if (pantallaAlertas.find(a => a.id === payload.id)) return;
+  pantallaAlertas.unshift(payload);
+  if (pantallaAlertas.length > 60) pantallaAlertas.length = 60;
+
+  if (esNueva) {
+    try {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = "sine"; osc.frequency.value = 880;
+      gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.35);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start(); osc.stop(audioCtx.currentTime + 0.35);
+    } catch(e){}
+    try { navigator.vibrate && navigator.vibrate([200, 100, 200]); } catch(e){}
+
+    const prev = document.body.style.background;
+    document.body.style.background = "#3a0a0a";
+    setTimeout(() => { document.body.style.background = prev || "#000"; }, 450);
+
+    if ("Notification" in window && Notification.permission === "granted") {
+      try {
+        new Notification("🔥 Hay público", {
+          body: payload.paradaNombre || "En una zona cercana",
+          tag: "pantalla-" + payload.id,
+        });
+      } catch(e){}
+    }
+  }
+  pintarPantalla();
+}
+
+function pintarPantalla() {
+  const lista = document.getElementById("pantalla-lista");
+  const vacio = document.getElementById("pantalla-vacio");
+  if (!lista) return;
+  const ahora = Date.now();
+
+  if (pantallaAlertas.length === 0) {
+    lista.innerHTML = "";
+    if (vacio) vacio.style.display = "";
+    return;
+  }
+  if (vacio) vacio.style.display = "none";
+
+  lista.innerHTML = pantallaAlertas.map(a => {
+    const edad = Math.floor((ahora - a.ts) / 1000);
+    const edadTxt = edad < 60 ? `${edad}s` : `${Math.floor(edad/60)} min`;
+    const nombre = a.paradaNombre || "Zona sin parada";
+    const fresh = edad < 120;
+    const emojiGrande = fresh ? "🔥" : "•";
+    return `
+      <div class="rounded-2xl border ${fresh ? "border-red-500 bg-gradient-to-r from-red-900/50 to-red-950/20 shadow-[0_0_30px_rgba(220,38,38,0.25)]" : "border-neutral-800 bg-neutral-900/60"} p-4 md:p-6">
+        <div class="flex items-center justify-between gap-4">
+          <div class="flex-1 min-w-0">
+            <div class="text-xs md:text-sm text-neutral-400 uppercase tracking-wide">${esc(a.usuario || "Taxi")}</div>
+            <div class="text-xl md:text-4xl font-bold text-white mt-1 truncate">${emojiGrande} ${esc(nombre)}</div>
+            ${a.lat && a.lng ? `<div class="text-[11px] md:text-sm text-neutral-500 font-mono mt-1">${a.lat.toFixed(4)}, ${a.lng.toFixed(4)}</div>` : ""}
+          </div>
+          <div class="text-right shrink-0">
+            <div class="text-2xl md:text-5xl font-mono font-bold ${fresh ? "text-red-400" : "text-neutral-500"}">${edadTxt}</div>
+          </div>
+        </div>
+      </div>`;
+  }).join("");
+}
 
 function destroyCharts() {
   activeCharts.forEach(c => { try { c.destroy(); } catch(e){} });
@@ -1157,6 +1314,11 @@ function renderHome() {
           </button>
           <button id="btn-wakelock" class="rounded-lg bg-neutral-800 border border-neutral-700 hover:border-brand-500 px-3 py-1.5 text-xs text-neutral-300" title="Mantener pantalla encendida">
             🌑
+          </button>
+        </div>
+        <div class="pt-1">
+          <button id="btn-abrir-pantalla" class="w-full rounded-lg bg-neutral-800 border border-neutral-700 hover:border-brand-500 py-1.5 text-xs font-semibold text-neutral-300">
+            📺 Abrir segunda pantalla
           </button>
         </div>
       </div>
@@ -1541,44 +1703,85 @@ function bindViewEvents() {
       showToast(Notification.permission === "granted" ? "🔔 Notificaciones activadas" : "Notificaciones no permitidas");
     });
 
-    // ---------- Web Push ----------
+    // ---------- Botón de push (con API nueva) ----------
     const btnPush = document.getElementById("btn-push");
     if (btnPush) {
       const perm = window.TaxiPush ? window.TaxiPush.permisos() : "unsupported";
       if (perm === "granted") {
-        btnPush.textContent = "✅ Avisos en 2º plano activos";
+        btnPush.textContent = "✅ Notificaciones activadas";
         btnPush.classList.add("border-green-500", "text-green-400");
       } else if (perm === "denied") {
         btnPush.textContent = "🚫 Notificaciones bloqueadas";
         btnPush.classList.add("border-red-500", "text-red-400");
       } else if (!window.TaxiPush || !window.TaxiPush.estaSoportado()) {
-        btnPush.textContent = "❌ No soportado en este navegador";
+        btnPush.textContent = "❌ Push no soportado";
         btnPush.classList.add("text-neutral-500");
       }
 
       btnPush.addEventListener("click", async () => {
-        if (!window.TaxiPush || !window.TaxiPush.estaSoportado()) {
-          showToast("❌ Tu navegador no soporta notificaciones push");
-          return;
-        }
-        const cluster = getClusterActual();
-        const topic = cluster ? cluster.canal : CANAL_GLOBAL;
+        if (!window.TaxiPush) { showToast("❌ Push no disponible"); return; }
+
+        const topicEspejo = "txd-global-avisos-2026-v1";
 
         btnPush.disabled = true;
         const previo = btnPush.textContent;
-        btnPush.textContent = "⏳ Suscribiendo…";
+        btnPush.textContent = "⏳ Configurando…";
 
-        const res = await window.TaxiPush.suscribir(topic);
+        // 1) Intentar Web Push
+        const res = await window.TaxiPush.suscribirWebPush(topicEspejo);
+
         if (res.ok) {
-          btnPush.textContent = "✅ Avisos en 2º plano activados";
+          btnPush.textContent = "✅ Web Push activado";
           btnPush.classList.remove("border-neutral-700");
           btnPush.classList.add("border-green-500", "text-green-400");
-          showToast("📡 Recibirás avisos aunque cierres la app");
-        } else {
-          btnPush.textContent = "❌ " + (res.motivo || "error");
-          btnPush.disabled = false;
-          setTimeout(() => { btnPush.textContent = previo; }, 4000);
+          showToast("📡 Web Push activado correctamente");
+
+          // Publicar notificación de prueba
+          const ok = await window.TaxiPush.probarNotificacion(topicEspejo);
+          if (ok) showToast("🧪 Enviada notificación de prueba");
+          return;
         }
+
+        // 2) Fallback: guiar a la app oficial de ntfy
+        btnPush.disabled = false;
+        btnPush.textContent = "📱 Usar app ntfy";
+        btnPush.classList.remove("border-neutral-700");
+        btnPush.classList.add("border-yellow-500", "text-yellow-400");
+
+        const esAndroid = /Android/i.test(navigator.userAgent);
+        const esIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+
+        let mensaje =
+          "Para recibir avisos con la pantalla apagada o la app cerrada, " +
+          "instala la app oficial de ntfy y suscríbete al topic:\n\n" +
+          topicEspejo +
+          "\n\nMotivo: " + (res.motivo || "Web Push no disponible en ntfy.sh público");
+
+        if (esAndroid) {
+          mensaje += "\n\n📲 Se abrirá la app ntfy (o Play Store si no la tienes).";
+          if (confirm(mensaje + "\n\n¿Continuar?")) {
+            window.location.href = "ntfy://ntfy.sh/" + topicEspejo;
+            setTimeout(() => {
+              window.open("https://play.google.com/store/apps/details?id=io.heckel.ntfy", "_blank");
+            }, 1500);
+          }
+        } else if (esIOS) {
+          mensaje += "\n\n📲 Se abrirá la app ntfy (o App Store si no la tienes).";
+          if (confirm(mensaje + "\n\n¿Continuar?")) {
+            window.location.href = "ntfy://ntfy.sh/" + topicEspejo;
+            setTimeout(() => {
+              window.open("https://apps.apple.com/app/ntfy/id1625396347", "_blank");
+            }, 1500);
+          }
+        } else {
+          mensaje += "\n\n🖥️ Se abrirá ntfy.sh/app para suscribirte en el navegador.";
+          if (confirm(mensaje + "\n\n¿Continuar?")) {
+            window.open("https://ntfy.sh/app", "_blank");
+          }
+        }
+
+        showToast("📱 Usa la app ntfy para avisos en segundo plano");
+        setTimeout(() => { btnPush.textContent = previo; }, 5000);
       });
     }
 
@@ -1607,6 +1810,12 @@ function bindViewEvents() {
       });
       document.addEventListener("visibilitychange", () => { if (!document.hidden) pintarWake(); });
     }
+
+    // ---------- Segunda pantalla ----------
+    const btnPantalla = document.getElementById("btn-abrir-pantalla");
+    if (btnPantalla) btnPantalla.addEventListener("click", () => {
+      window.open(location.pathname + "?pantalla=1", "_blank", "width=1280,height=800");
+    });
   }
 
   if (state.view === "jornada") {
@@ -2426,10 +2635,15 @@ setInterval(() => {
 
 /* ===================== Arranque ===================== */
 load();
-recalcularClusters();
-render();
-initGeolocation();
-setTimeout(procesarCola, 2000);
+
+if (MODO_PANTALLA) {
+  initModoPantalla();
+} else {
+  recalcularClusters();
+  render();
+  initGeolocation();
+  setTimeout(procesarCola, 2000);
+}
 </script>
 
 <!-- Registro explícito del Service Worker (garantiza PWA válida en PWABuilder) -->
