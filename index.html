@@ -1089,10 +1089,11 @@ function destroyCharts() {
 }
 
 function render() {
-  const views = { home:renderHome, jornada:renderJornada, servicios:renderServicios, gastos:renderGastos, paradas:renderParadas, dashboard:renderDashboard };
+  const views = { home:renderHome, jornada:renderJornada, servicios:renderServicios, gastos:renderGastos, paradas:renderParadas, dashboard:renderDashboard, calcular:renderCalcular };
   const renderView = views[state.view] || renderHome;
 
   if (map) { try { map.remove(); } catch(e){} map = null; }
+  if (calcMap) { try { calcMap.remove(); } catch(e){} calcMap = null; calcRouteLayer = null; }
   paradaMarkers = {}; userMarker = null; userCircle = null;
   fireMarkers = [];
   destroyCharts();
@@ -1105,7 +1106,7 @@ function render() {
       <button id="fab-hay-publico" title="Toca para avisar · Arrastra para mover">🔥<span class="fab-label"> Hay público</span></button>
 
       <div id="news-ticker" class="hidden"></div>
-      <nav class="fixed bottom-0 left-0 right-0 max-w-md mx-auto bg-neutral-950/95 backdrop-blur border-t border-neutral-800 grid grid-cols-6 z-[500]">
+      <nav class="fixed bottom-0 left-0 right-0 max-w-md mx-auto bg-neutral-950/95 backdrop-blur border-t border-neutral-800 grid grid-cols-7 z-[500]">
         ${[
           { id:"home", label:"Inicio", emoji:"🏠" },
           { id:"jornada", label:"Jornada", emoji:"🕒" },
@@ -1113,6 +1114,7 @@ function render() {
           { id:"gastos", label:"Gastos", emoji:"⛽" },
           { id:"paradas", label:"Paradas", emoji:"📍" },
           { id:"dashboard", label:"Panel", emoji:"📊" },
+          { id:"calcular", label:"Precio", emoji:"💶" },
         ].map(n => `
           <button data-nav="${n.id}" class="flex flex-col items-center justify-center py-2 text-[10px] gap-0.5 ${state.view===n.id?"text-brand-500":"text-neutral-500"}">
             <span class="text-lg">${n.emoji}</span>${n.label}
@@ -1202,7 +1204,6 @@ function initFab() {
     }
   };
 
-  // -------- Touch (Android / iOS) --------
   fab.addEventListener("touchstart", (e) => {
     if (e.touches.length !== 1) return;
     const t = e.touches[0];
@@ -1228,7 +1229,6 @@ function initFab() {
     fab.classList.remove("dragging");
   });
 
-  // -------- Mouse (escritorio) --------
   fab.addEventListener("mousedown", (e) => {
     if (e.button !== 0) return;
     handleStart(e.clientX, e.clientY);
@@ -1264,6 +1264,7 @@ function renderHome() {
     { id:"gastos", label:"Gastos", emoji:"⛽", desc:"Combustible, peajes y más" },
     { id:"paradas", label:"Paradas", emoji:"📍", desc:"Mapa y tiempos de espera" },
     { id:"dashboard", label:"Panel", emoji:"📊", desc:"Resumen de tu actividad" },
+    { id:"calcular", label:"Calcular precio", emoji:"💶", desc:"Ruta + tarifas Madrid" },
   ];
   const activa = !!state.jornadaActivaId;
   const clusterActual = getClusterActual();
@@ -1608,6 +1609,249 @@ function renderDashboard() {
     </div>`;
 }
 
+/* ===================== Calculadora de precio ===================== */
+let calcMap = null, calcRouteLayer = null, calcOriginMode = "mine";
+
+function renderCalcular() {
+  return `
+    <div class="p-4 space-y-4">
+      <h2 class="text-lg font-bold">💶 Calcular precio</h2>
+      <div class="rounded-xl bg-neutral-900 border border-neutral-800 p-4 space-y-3">
+        <div>
+          <label class="text-[10px] text-neutral-400 font-semibold uppercase tracking-wide">📍 Origen</label>
+          <div class="grid grid-cols-2 gap-2 mt-1">
+            <button id="calc-origen-mine" class="rounded-lg py-2 text-sm font-medium border ${calcOriginMode==="mine"?"bg-brand-500 text-brand-900 border-brand-500":"bg-neutral-800 border-neutral-700 text-neutral-300"}">📍 Mi ubicación</button>
+            <button id="calc-origen-other" class="rounded-lg py-2 text-sm font-medium border ${calcOriginMode==="other"?"bg-brand-500 text-brand-900 border-brand-500":"bg-neutral-800 border-neutral-700 text-neutral-300"}">🏠 Otra dirección</button>
+          </div>
+          <input id="calc-origen-dir" placeholder="Dirección de origen" class="mt-2 w-full rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2 text-sm" style="display:${calcOriginMode==="other"?"block":"none"}" />
+        </div>
+        <div>
+          <label class="text-[10px] text-neutral-400 font-semibold uppercase tracking-wide">🎯 Destino</label>
+          <input id="calc-destino-dir" placeholder="Dirección destino (ej: Aeropuerto T4)" class="mt-1 w-full rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2 text-sm" />
+        </div>
+        <button id="calc-ruta-btn" class="w-full rounded-lg bg-blue-600 hover:bg-blue-500 py-2 font-semibold text-white text-sm">🗺️ Calcular ruta en coche</button>
+        <div id="calc-ruta-info" class="text-xs text-neutral-400 hidden"></div>
+        <div id="calc-map" style="height:220px;border-radius:10px;overflow:hidden;display:none"></div>
+        <div class="grid grid-cols-2 gap-2">
+          <div>
+            <label class="text-[10px] text-neutral-400 font-semibold uppercase tracking-wide">Distancia (km)</label>
+            <input id="calc-distancia" type="number" step="0.1" min="0" placeholder="8.5" class="mt-1 w-full rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2 text-sm" />
+          </div>
+          <div>
+            <label class="text-[10px] text-neutral-400 font-semibold uppercase tracking-wide">Duración (min)</label>
+            <input id="calc-duracion" type="number" step="1" min="0" placeholder="20" class="mt-1 w-full rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2 text-sm" />
+          </div>
+        </div>
+        <div>
+          <label class="text-[10px] text-neutral-400 font-semibold uppercase tracking-wide">Tarifa</label>
+          <select id="calc-tarifa" class="mt-1 w-full rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2 text-sm">
+            <option value="tarifa1">Tarifa 1 · Laborable 7-21h</option>
+            <option value="tarifa2">Tarifa 2 · Noche/festivo</option>
+            <option value="tarifa3">Tarifa 3 · Aeropuerto &lt;9km</option>
+            <option value="tarifa4">Tarifa 4 · Aeropuerto ↔ M-30 (33€)</option>
+            <option value="tarifa7">Tarifa 7 · Estaciones/IFEMA</option>
+          </select>
+        </div>
+        <label class="flex items-center gap-2 text-sm">
+          <input id="calc-festivo" type="checkbox" class="w-4 h-4" />
+          <span>Nochebuena / Nochevieja (+7 €)</span>
+        </label>
+        <button id="calc-btn" class="w-full rounded-lg bg-brand-500 hover:bg-brand-400 text-brand-900 py-2.5 font-bold">Calcular precio</button>
+      </div>
+      <div id="calc-resultado" class="hidden rounded-xl bg-neutral-900 border border-neutral-800 overflow-hidden">
+        <div class="bg-gradient-to-r from-brand-500 to-brand-600 text-brand-900 p-4">
+          <div class="text-xs font-semibold uppercase tracking-wide opacity-80">Precio estimado</div>
+          <div id="calc-total" class="text-3xl font-bold mt-1">0,00 €</div>
+        </div>
+        <div id="calc-desglose" class="p-4 text-sm text-neutral-300"></div>
+      </div>
+      <p class="text-[10px] text-neutral-600 leading-relaxed">
+        Tarifas orientativas según Ordenanza del Taxi de Madrid 2026. No incluyen suplementos por equipaje, animales, etc.
+      </p>
+    </div>`;
+}
+
+async function calcGeocode(q) {
+  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=es&q=${encodeURIComponent(q)}`;
+  const res = await fetch(url, { headers: { "Accept-Language": "es" } });
+  if (!res.ok) throw new Error("Geocoding HTTP " + res.status);
+  const data = await res.json();
+  if (!data || !data.length) return null;
+  return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon), label: data[0].display_name };
+}
+
+async function calcRouteDrive(from, to) {
+  const url = `https://router.project-osrm.org/route/v1/driving/${from.lon},${from.lat};${to.lon},${to.lat}?overview=full&geometries=geojson`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("Routing HTTP " + res.status);
+  const data = await res.json();
+  if (!data.routes || !data.routes.length) return null;
+  const r = data.routes[0];
+  return { km: r.distance / 1000, minutes: r.duration / 60, coords: r.geometry?.coordinates || [] };
+}
+
+function initCalcMap() {
+  if (calcMap) return calcMap;
+  const el = document.getElementById("calc-map");
+  if (!el || typeof L === "undefined") return null;
+  try {
+    calcMap = L.map(el, { zoomControl: true, attributionControl: false }).setView([40.4168, -3.7038], 11);
+    L.tileLayer("https://{s}.google.com/vt/lyrs=m&hl=es&x={x}&y={y}&z={z}", {
+      subdomains: ["mt0","mt1","mt2","mt3"], maxZoom: 21,
+    }).addTo(calcMap);
+    calcRouteLayer = L.layerGroup().addTo(calcMap);
+  } catch(e) { console.error("Error calc map:", e); return null; }
+  return calcMap;
+}
+
+function drawCalcRoute(origin, dest, coords) {
+  const el = document.getElementById("calc-map"); if (!el) return;
+  el.style.display = "block";
+  const m = initCalcMap(); if (!m) return;
+  setTimeout(() => m.invalidateSize(), 50);
+  calcRouteLayer.clearLayers();
+  L.circleMarker([origin.lat, origin.lon], { radius: 9, color: "#fff", weight: 3, fillColor: "#16a34a", fillOpacity: 1 }).addTo(calcRouteLayer).bindTooltip("Origen");
+  L.circleMarker([dest.lat, dest.lon], { radius: 9, color: "#fff", weight: 3, fillColor: "#dc2626", fillOpacity: 1 }).addTo(calcRouteLayer).bindTooltip("Destino");
+  if (Array.isArray(coords) && coords.length > 1) {
+    const latlngs = coords.map(([lon, lat]) => [lat, lon]);
+    L.polyline(latlngs, { color: "#2563eb", weight: 5, opacity: 0.85 }).addTo(calcRouteLayer);
+    m.fitBounds(L.latLngBounds(latlngs), { padding: [30, 30] });
+  } else {
+    L.polyline([[origin.lat, origin.lon], [dest.lat, dest.lon]], { color: "#2563eb", weight: 4, opacity: 0.7, dashArray: "8,8" }).addTo(calcRouteLayer);
+    m.fitBounds(L.latLngBounds([[origin.lat, origin.lon], [dest.lat, dest.lon]]), { padding: [30, 30] });
+  }
+}
+
+async function calcRuta() {
+  const infoEl = document.getElementById("calc-ruta-info");
+  const btn = document.getElementById("calc-ruta-btn");
+  if (infoEl) { infoEl.classList.remove("hidden"); infoEl.innerHTML = "Calculando ruta..."; }
+  if (btn) btn.disabled = true;
+  try {
+    let origin;
+    if (calcOriginMode === "mine") {
+      if (!lastPosition) {
+        if (infoEl) infoEl.innerHTML = "Obteniendo ubicación GPS...";
+        await new Promise((resolve, reject) => {
+          if (!navigator.geolocation) return reject(new Error("Geolocalización no soportada"));
+          navigator.geolocation.getCurrentPosition(
+            (p) => { lastPosition = { lat: p.coords.latitude, lng: p.coords.longitude }; resolve(); },
+            (e) => reject(new Error("No se pudo obtener ubicación: " + e.message)),
+            { enableHighAccuracy: true, timeout: 15000 }
+          );
+        });
+      }
+      origin = { lat: lastPosition.lat, lon: lastPosition.lng, label: "Mi ubicación" };
+    } else {
+      const q = (document.getElementById("calc-origen-dir")?.value || "").trim();
+      if (!q) throw new Error("Introduce la dirección de origen");
+      if (infoEl) infoEl.innerHTML = "Buscando origen...";
+      const g = await calcGeocode(q);
+      if (!g) throw new Error("No se encontró el origen");
+      origin = g;
+    }
+    const dq = (document.getElementById("calc-destino-dir")?.value || "").trim();
+    if (!dq) throw new Error("Introduce la dirección de destino");
+    if (infoEl) infoEl.innerHTML = "Buscando destino...";
+    const dest = await calcGeocode(dq);
+    if (!dest) throw new Error("No se encontró el destino");
+    if (infoEl) infoEl.innerHTML = "Calculando ruta en coche...";
+    const route = await calcRouteDrive(origin, dest);
+    if (!route) throw new Error("No se pudo calcular la ruta");
+    document.getElementById("calc-distancia").value = route.km.toFixed(1);
+    document.getElementById("calc-duracion").value = Math.round(route.minutes);
+    if (infoEl) {
+      const shortA = origin.label.length > 40 ? origin.label.slice(0, 40) + "…" : origin.label;
+      const shortB = dest.label.length > 40 ? dest.label.slice(0, 40) + "…" : dest.label;
+      infoEl.innerHTML = `<span style="color:#4ade80;">✓</span> <b>${esc(shortA)}</b> → <b>${esc(shortB)}</b><br>${route.km.toFixed(1)} km · ${Math.round(route.minutes)} min en coche`;
+    }
+    drawCalcRoute(origin, dest, route.coords);
+  } catch (e) {
+    if (infoEl) infoEl.innerHTML = `<span style="color:#f87171;">✘ ${esc(e.message)}</span>`;
+    const mapEl = document.getElementById("calc-map"); if (mapEl) mapEl.style.display = "none";
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function calcPrecio() {
+  const dist = parseFloat(document.getElementById("calc-distancia").value) || 0;
+  const dur = parseFloat(document.getElementById("calc-duracion").value) || 0;
+  const tarifa = document.getElementById("calc-tarifa").value;
+  const festivo = document.getElementById("calc-festivo").checked;
+  const resultEl = document.getElementById("calc-resultado");
+  const totalEl = document.getElementById("calc-total");
+  const descEl = document.getElementById("calc-desglose");
+
+  if (dist <= 0 && tarifa !== "tarifa4") {
+    showToast("Introduce la distancia o calcula la ruta primero");
+    return;
+  }
+
+  let total = 0, desc = "";
+  if (tarifa === "tarifa4") {
+    total = 33;
+    desc = `<div><b>Tarifa 4 (Fija):</b> Aeropuerto Adolfo Suárez Madrid-Barajas ↔ Interior M-30.</div>`;
+  } else if (tarifa === "tarifa3") {
+    const base = 22, pkm = 1.30, ph = 23;
+    total = Math.max(base, base + (dist * pkm) + ((dur / 60) * ph));
+    desc = `<div><b>Tarifa 3 (Aeropuerto &lt;9km):</b> Mínimo ${formatEuro(base)}</div>
+      <div class="text-xs text-neutral-500 mt-1">Bajada ${formatEuro(base)} + ${formatEuro(pkm)}/km + ${formatEuro(ph)}/h</div>`;
+  } else if (tarifa === "tarifa7") {
+    const base = 7.50, pkm = 1.30, ph = 23;
+    total = Math.max(base, 2.50 + (dist * pkm) + ((dur / 60) * ph));
+    desc = `<div><b>Tarifa 7:</b> Estaciones / IFEMA. Mínimo ${formatEuro(base)}</div>
+      <div class="text-xs text-neutral-500 mt-1">Bajada 2,50 € + ${formatEuro(pkm)}/km + ${formatEuro(ph)}/h</div>`;
+  } else if (tarifa === "tarifa2") {
+    const base = 3.30, pkm = 1.50, ph = 27;
+    total = base + (dist * pkm) + ((dur / 60) * ph);
+    desc = `<div><b>Tarifa 2:</b> Nocturna (21-07), fines de semana y festivos.</div>
+      <div class="text-xs text-neutral-500 mt-1">Bajada ${formatEuro(base)} + ${formatEuro(pkm)}/km + ${formatEuro(ph)}/h</div>`;
+  } else {
+    const base = 2.50, pkm = 1.30, ph = 23;
+    total = base + (dist * pkm) + ((dur / 60) * ph);
+    desc = `<div><b>Tarifa 1:</b> Laborables de 07:00 a 21:00h.</div>
+      <div class="text-xs text-neutral-500 mt-1">Bajada ${formatEuro(base)} + ${formatEuro(pkm)}/km + ${formatEuro(ph)}/h</div>`;
+  }
+
+  if (festivo && tarifa !== "tarifa4") {
+    total += 7;
+    desc += `<div class="text-red-400 text-xs mt-1">+ Suplemento Nochebuena/Nochevieja: 7,00 €</div>`;
+  }
+
+  if (totalEl) totalEl.textContent = formatEuro(total);
+  if (descEl) descEl.innerHTML = `
+    <div class="space-y-1">
+      ${desc}
+      <div class="pt-2 mt-2 border-t border-neutral-800 text-xs text-neutral-500 flex justify-between">
+        <span>Distancia: ${dist} km</span>
+        <span>Duración: ${dur} min</span>
+      </div>
+    </div>`;
+  if (resultEl) resultEl.classList.remove("hidden");
+}
+
+function bindCalcEvents() {
+  const btnMine = document.getElementById("calc-origen-mine");
+  const btnOther = document.getElementById("calc-origen-other");
+  if (btnMine) btnMine.addEventListener("click", () => {
+    calcOriginMode = "mine";
+    btnMine.className = "rounded-lg py-2 text-sm font-medium border bg-brand-500 text-brand-900 border-brand-500";
+    btnOther.className = "rounded-lg py-2 text-sm font-medium border bg-neutral-800 border-neutral-700 text-neutral-300";
+    document.getElementById("calc-origen-dir").style.display = "none";
+  });
+  if (btnOther) btnOther.addEventListener("click", () => {
+    calcOriginMode = "other";
+    btnOther.className = "rounded-lg py-2 text-sm font-medium border bg-brand-500 text-brand-900 border-brand-500";
+    btnMine.className = "rounded-lg py-2 text-sm font-medium border bg-neutral-800 border-neutral-700 text-neutral-300";
+    document.getElementById("calc-origen-dir").style.display = "block";
+  });
+  const btnRuta = document.getElementById("calc-ruta-btn");
+  if (btnRuta) btnRuta.addEventListener("click", calcRuta);
+  const btnCalc = document.getElementById("calc-btn");
+  if (btnCalc) btnCalc.addEventListener("click", calcPrecio);
+}
+
 /* ===================== Selección parada ===================== */
 function seleccionarParada(id) {
   const p = getAllParadas().find(x => x.id === id);
@@ -1703,7 +1947,6 @@ function bindViewEvents() {
       showToast(Notification.permission === "granted" ? "🔔 Notificaciones activadas" : "Notificaciones no permitidas");
     });
 
-    // ---------- Botón de push (con API nueva) ----------
     const btnPush = document.getElementById("btn-push");
     if (btnPush) {
       const perm = window.TaxiPush ? window.TaxiPush.permisos() : "unsupported";
@@ -1727,7 +1970,6 @@ function bindViewEvents() {
         const previo = btnPush.textContent;
         btnPush.textContent = "⏳ Configurando…";
 
-        // 1) Intentar Web Push
         const res = await window.TaxiPush.suscribirWebPush(topicEspejo);
 
         if (res.ok) {
@@ -1736,13 +1978,11 @@ function bindViewEvents() {
           btnPush.classList.add("border-green-500", "text-green-400");
           showToast("📡 Web Push activado correctamente");
 
-          // Publicar notificación de prueba
           const ok = await window.TaxiPush.probarNotificacion(topicEspejo);
           if (ok) showToast("🧪 Enviada notificación de prueba");
           return;
         }
 
-        // 2) Fallback: guiar a la app oficial de ntfy
         btnPush.disabled = false;
         btnPush.textContent = "📱 Usar app ntfy";
         btnPush.classList.remove("border-neutral-700");
@@ -1785,9 +2025,8 @@ function bindViewEvents() {
       });
     }
 
-    // ---------- Wake Lock ----------
     const btnWake = document.getElementById("btn-wakelock");
-    if (btnWake) {
+if (btnWake) {
       const pintarWake = () => {
         const activo = window.TaxiWakeLock && window.TaxiWakeLock.estaActivo();
         btnWake.textContent = activo ? "🔆" : "🌑";
@@ -1811,7 +2050,6 @@ function bindViewEvents() {
       document.addEventListener("visibilitychange", () => { if (!document.hidden) pintarWake(); });
     }
 
-    // ---------- Segunda pantalla ----------
     const btnPantalla = document.getElementById("btn-abrir-pantalla");
     if (btnPantalla) btnPantalla.addEventListener("click", () => {
       window.open(location.pathname + "?pantalla=1", "_blank", "width=1280,height=800");
@@ -2022,6 +2260,10 @@ function bindViewEvents() {
       });
       paint();
     }));
+  }
+
+  if (state.view === "calcular") {
+    bindCalcEvents();
   }
 }
 
@@ -2657,4 +2899,4 @@ if (MODO_PANTALLA) {
   }
 </script>
 </body>
-  </html>
+</html>
